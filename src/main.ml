@@ -60,7 +60,7 @@ let nick, userprefix_re, mention_re =
 
   nick,
   Re.(compile (seq [group nick; char '!'; group (rep1 any)])),
-  Re.(compile (seq [bound; (alt [seq [char '@'; group nick]; seq [group nick; alt [char ':'; char ',']]]); bound]))
+  Re.(compile (seq [bound; seq [char '@'; group nick]; bound]))
 
 let names_nick_re =
   Re.(compile (seq [alt [char '@'; char '+'; epsilon]; group nick]))
