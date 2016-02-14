@@ -1,0 +1,14 @@
+# The project name. Used to name library files, the top binary, and the docdir.
+project = "lyrebird"
+# The ocamlfind package name.
+package = "lyrebird"
+# A list of ocamlfind packages required by this project.
+requires = [
+    "lwt"
+    "utop"
+    "re"
+    "batteries"
+    "ppx_deriving.std"
+]
+# A list of additional flags to pass to ocamlbuild.
+flags = []

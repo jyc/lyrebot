@@ -1,0 +1,4 @@
+# begin mk _tags
+true: package(lwt), package(utop), package(re), package(batteries), package(ppx_deriving.std)
+# end
+true: thread, safe_string

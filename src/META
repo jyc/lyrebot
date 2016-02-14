@@ -1,0 +1,5 @@
+# begin mk META
+requires = "lwt utop re batteries ppx_deriving.std"
+archive(byte) = "lyrebird.cma"
+archive(native) = "lyrebird.cmxa"
+# end
