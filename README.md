@@ -32,4 +32,4 @@ Then when you send a message like this (in the channel or as a private message):
 ... and jyc gets a private message the next time he's online:
 
     <lyrebot> *** You've got mail! ***
-    <lyrebot> 10:14 2/3 (5d ago)  <jyc> @jyc Long time no see! How are you doing?
+    <lyrebot> 10:14 2/3 (5d ago)  <jyc`> @jyc Long time no see! How are you doing?
