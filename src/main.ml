@@ -138,7 +138,7 @@ let work ~nick ~channel (inp, outp) =
       Lwt_list.iter_s (fun { Mail.time; from; text } ->
         let { Unix.tm_hour; tm_min; tm_mday; tm_mon } = Unix.gmtime time in
         let dt = Unix.time () -. time in
-        message joined @@ sprintf "%d:%d %d/%d (%s)  %s: %s" tm_hour tm_min tm_mon tm_mday (ago dt) from text
+        message joined @@ sprintf "%02d:%02d %d/%d (%s)  <%s> %s" tm_hour tm_min (tm_mon + 1) tm_mday (ago dt) from text
       ) mail
       >>= fun () ->
       return { state with State.mailboxes = StringMap.remove joined mailboxes }
