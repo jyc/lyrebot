@@ -60,7 +60,7 @@ let nick, userprefix_re, mention_re =
 
   nick,
   Re.(compile (seq [group nick; char '!'; group (rep1 any)])),
-  Re.(compile (seq [bound; seq [char '@'; group nick]; bound]))
+  Re.(compile (seq [bound; char '@'; group nick; bound]))
 
 let names_nick_re =
   Re.(compile (seq [alt [char '@'; char '+'; epsilon]; group nick]))
@@ -117,9 +117,7 @@ let work ~nick ~channel (inp, outp) =
                    State.mailboxes = StringMap.add dest (mail :: old) mailboxes }
       in
       match Re.Group.all g with
-      | [|_; dest; ""|] ->
-        record dest text
-      | [|_; ""; dest|] ->
+      | [|_; dest|] ->
         record dest text
       | _ -> return state
       | exception Not_found -> return state
