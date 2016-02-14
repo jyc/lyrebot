@@ -119,7 +119,7 @@ let work ~nick ~channel (inp, outp) =
       match Re.Group.all g with
       | [|_; dest|] ->
         record dest text
-      | _ -> return state
+      | _ -> assert false
       | exception Not_found -> return state
     in
     Lwt_list.fold_left_s on_match state (Re.all mention_re text)
@@ -186,7 +186,7 @@ let work ~nick ~channel (inp, outp) =
           |> List.filter_map (fun part ->
             match Re.Group.all (Re.exec names_nick_re part) with
             | [|_; nick|] -> Some nick
-            | _ -> None
+            | _ -> assert false
             | exception Not_found -> None
           )
         in
