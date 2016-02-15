@@ -209,18 +209,18 @@ let work ~nick ~channel (inp, outp) =
          For PART/JOIN the RFC seems to indicate that the target be included in the middles,
          but with UnrealIRCd it seems like it was included in the trailing.
          Because we only join one channel right now we'll just ignore it. *)
-      | `Ok ({ Message.command = "PART"; prefix = Some prefix } as msg) ->
+      | `Ok ({ Message.command = "PART" | "QUIT"; prefix = Some prefix } as msg) ->
         begin match Re.Group.all (Re.exec userprefix_re prefix) with
-        | [|_; nick; _|] when nick <> "" ->
+        | [|_; nick; _|] ->
           handle { state with State.neighbors = NickSet.remove nick neighbors }
         | _ -> 
-          Lwt.fail_with @@ sprintf "Error: unrecognized PART message: %s" (Message.show msg)
+          Lwt.fail_with @@ sprintf "Error: unrecognized PART/QUIT message: %s" (Message.show msg)
         end
 
       (* JOIN *)
       | `Ok ({ Message.command = "JOIN"; prefix = Some prefix } as msg) ->
         begin match Re.Group.all (Re.exec userprefix_re prefix) with
-        | [|_; nick; _|] when nick <> "" ->
+        | [|_; nick; _|] ->
           forward state nick
           >>= fun state' ->
           handle { state' with State.neighbors = NickSet.add nick neighbors }
@@ -228,17 +228,25 @@ let work ~nick ~channel (inp, outp) =
           Lwt.fail_with @@ sprintf "Error: unrecognized JOIN message: %s" (Message.show msg)
         end
 
-      (* QUIT *)
-      | `Ok ({ Message.command = "QUIT"; prefix = Some prefix } as msg) ->
+      (* KILL nick comment *)
+      | `Ok { Message.command = "KILL"; middles = (nick :: _) } ->
+        handle { state with State.neighbors = NickSet.remove nick neighbors }
+
+      (* KICK channel nick *)
+      | `Ok { Message.command = "KICK"; middles = (_ :: nick :: _) } ->
+        handle { state with State.neighbors = NickSet.remove nick neighbors }
+
+      (* NICK nickname hopcount *)
+      | `Ok ({ Message.command = "NICK"; prefix = Some prefix; trailing = Some new_nick } as msg) ->
         begin match Re.Group.all (Re.exec userprefix_re prefix) with
-        | [|_; nick; _|] when nick <> "" ->
-          handle { state with State.neighbors = NickSet.remove nick neighbors }
+        | [|_; old_nick; _|] ->
+          handle { state with State.neighbors = NickSet.update old_nick new_nick neighbors }
         | _ -> 
-          Lwt.fail_with @@ sprintf "Error: unrecognized QUIT message: %s" (Message.show msg)
+          Lwt.fail_with @@ sprintf "Error: unrecognized JOIN message: %s" (Message.show msg)
         end
 
       (* PRIVMSG *)
-      | `Ok ({ Message.command = "PRIVMSG"; prefix = Some prefix; middles=[target]; trailing=Some text } as msg) ->
+      | `Ok ({ Message.command = "PRIVMSG"; prefix = Some prefix; middles = [target]; trailing = Some text } as msg) ->
         begin match Re.Group.all (Re.exec userprefix_re prefix) with
         | [|_; nick; _|] when nick <> "" -> 
           return nick
