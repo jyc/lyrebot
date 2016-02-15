@@ -59,3 +59,13 @@ module Message = struct
     end ;
     Buffer.contents out
 end
+
+module Nick = struct
+  type t = string
+  let compare a b =
+    let a' = String.lowercase a in
+    let b' = String.lowercase b in
+    if a' < b' then -1
+    else if a' = b' then 0
+    else 1
+end

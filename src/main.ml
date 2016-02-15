@@ -23,26 +23,35 @@ module Mail = struct
   }
 end
 
-module StringOrd = struct
-end
-
-(* Thanks Batteries! *)
-module StringMap = Map.Make(String)
-module StringSet = Set.Make(String)
+(* IRC nicknames are case-insensitive. *)
+module NickMap = Map.Make(IRC.Nick)
+module NickSet = Set.Make(IRC.Nick)
 
 module State = struct
   type t = {
     registered : bool;
-    mailboxes : (Mail.t list) StringMap.t;
-    neighbors : StringSet.t;
+    mailboxes : (Mail.t list) NickMap.t;
+    neighbors : NickSet.t;
   }
 
   let empty = { 
     registered = false;
-    mailboxes = StringMap.empty;
-    neighbors = StringSet.empty;
+    mailboxes = NickMap.empty;
+    neighbors = NickSet.empty;
   }
 end
+
+(** [Re.all] doesn't work because it will try to match after the last character
+    in the previous match. The [bounds] we put on either side means that "@a
+    @b" won't match, but "@a  @b" will. To fix this we do something similar wrt
+    increasing the search start position, but base it on the start of the
+    previous match (because we have @ to start with). *)
+let rec exec_all ?(pos=0) re s =
+  match Re.exec ~pos re s with
+  | g ->
+    let pos' = Re.Group.start g 0 + 1 in
+    g :: exec_all ~pos:pos' re s
+  | exception Not_found -> []
 
 let send outp msg =
   Lwt_io.write outp (Message.to_string msg)
@@ -104,17 +113,17 @@ let work ~nick ~channel (inp, outp) =
       (** [record dest text] tries to record the message [text] for the user
           with nick [dest]. *)
       let record dest text =
-        if StringSet.mem dest neighbors then return state
+        if NickSet.mem dest neighbors then return state
         else 
           message from @@ sprintf "I'll forward your message the next time %s logs in." dest
           >>= fun () ->
           let mail = { Mail.time = Unix.time (); from; text } in
           let old =
-            if StringMap.mem dest mailboxes then StringMap.find dest mailboxes
+            if NickMap.mem dest mailboxes then NickMap.find dest mailboxes
             else []
           in
           return { state with 
-                   State.mailboxes = StringMap.add dest (mail :: old) mailboxes }
+                   State.mailboxes = NickMap.add dest (mail :: old) mailboxes }
       in
       match Re.Group.all g with
       | [|_; dest|] ->
@@ -122,11 +131,11 @@ let work ~nick ~channel (inp, outp) =
       | _ -> assert false
       | exception Not_found -> return state
     in
-    Lwt_list.fold_left_s on_match state (Re.all mention_re text)
+    Lwt_list.fold_left_s on_match state (exec_all mention_re text)
 
   and forward ({ State.mailboxes } as state) joined =
     let mail = 
-      if StringMap.mem joined mailboxes then StringMap.find joined mailboxes
+      if NickMap.mem joined mailboxes then NickMap.find joined mailboxes
       else []
     in
     if mail = [] then return state
@@ -139,7 +148,7 @@ let work ~nick ~channel (inp, outp) =
         message joined @@ sprintf "%02d:%02d %d/%d (%s)  <%s> %s" tm_hour tm_min (tm_mon + 1) tm_mday (ago dt) from text
       ) mail
       >>= fun () ->
-      return { state with State.mailboxes = StringMap.remove joined mailboxes }
+      return { state with State.mailboxes = NickMap.remove joined mailboxes }
 
   (** [handle state] handles IRC-level commands like PING, end of MOTD, etc.
       It is responsibel for identifying on the first PING and joining on the end of MOTD.
@@ -193,7 +202,7 @@ let work ~nick ~channel (inp, outp) =
         handle { state with
                  State.neighbors = 
                    List.fold_left (fun neighbors nick ->
-                     StringSet.add nick neighbors
+                     NickSet.add nick neighbors
                    ) neighbors nicks }
 
       (* PART
@@ -203,7 +212,7 @@ let work ~nick ~channel (inp, outp) =
       | `Ok ({ Message.command = "PART"; prefix = Some prefix } as msg) ->
         begin match Re.Group.all (Re.exec userprefix_re prefix) with
         | [|_; nick; _|] when nick <> "" ->
-          handle { state with State.neighbors = StringSet.remove nick neighbors }
+          handle { state with State.neighbors = NickSet.remove nick neighbors }
         | _ -> 
           Lwt.fail_with @@ sprintf "Error: unrecognized PART message: %s" (Message.show msg)
         end
@@ -214,7 +223,7 @@ let work ~nick ~channel (inp, outp) =
         | [|_; nick; _|] when nick <> "" ->
           forward state nick
           >>= fun state' ->
-          handle { state' with State.neighbors = StringSet.add nick neighbors }
+          handle { state' with State.neighbors = NickSet.add nick neighbors }
         | _ -> 
           Lwt.fail_with @@ sprintf "Error: unrecognized JOIN message: %s" (Message.show msg)
         end
@@ -223,7 +232,7 @@ let work ~nick ~channel (inp, outp) =
       | `Ok ({ Message.command = "QUIT"; prefix = Some prefix } as msg) ->
         begin match Re.Group.all (Re.exec userprefix_re prefix) with
         | [|_; nick; _|] when nick <> "" ->
-          handle { state with State.neighbors = StringSet.remove nick neighbors }
+          handle { state with State.neighbors = NickSet.remove nick neighbors }
         | _ -> 
           Lwt.fail_with @@ sprintf "Error: unrecognized QUIT message: %s" (Message.show msg)
         end
