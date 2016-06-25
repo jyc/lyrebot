@@ -71,6 +71,19 @@ let nick, userprefix_re, mention_re =
   Re.(compile (seq [group nick; char '!'; group (rep1 any)])),
   Re.(compile (seq [bound; char '@'; group nick; bound]))
 
+(* We have to do this ourselves instead of using Re.exec_all because Re doesn't
+   treat the start of the substring indicated by ~pos as the start of the
+   string. *)
+let extract_mentions text =
+  let rec loop matches rest =
+    match Re.exec_opt mention_re rest with
+    | Some groups ->
+      let nick = Re.Group.get groups 1 in
+      loop (nick :: matches) (String.tail rest (Re.Group.stop groups 1))
+    | None -> matches
+  in
+  loop [] text
+
 let names_nick_re =
   Re.(compile (seq [alt [char '@'; char '+'; epsilon]; group nick]))
 
@@ -91,25 +104,12 @@ let work ~nick ~channel (inp, outp) =
     in
     send (Message.make "PRIVMSG" ~trailing:text' [target])
   in
-  (*
-  let reply other target text =
-    (* If this is a message in the channel, [target] is the channel and we want
-       to prefix the message with the nick of the user we're replying to (other).
-       If this is a private message, [target] is [nick] and we don't want a prefix,
-       but we want [target] to be [other] (otherwise we message ourselves.) *)
-    let text', target' =
-      if target = nick then text, other
-      else sprintf "%s: %s" other text, target
-    in
-    send (Message.make "PRIVMSG" ~trailing:text' [target'])
-  in
-  *)
 
   (** [execute state msg from target text] handles the message [msg] sent from the
         user whose nick is [from] in [target] (either [channel] or [nick]) with
         text [text]. *)
   let rec execute ({ State.mailboxes; neighbors } as state) msg from target text =
-    let on_match state g =
+    let on_match state nick =
       (** [record dest text] tries to record the message [text] for the user
           with nick [dest]. *)
       let record dest text =
@@ -125,13 +125,9 @@ let work ~nick ~channel (inp, outp) =
           return { state with 
                    State.mailboxes = NickMap.add dest (mail :: old) mailboxes }
       in
-      match Re.Group.all g with
-      | [|_; dest|] ->
-        record dest text
-      | _ -> assert false
-      | exception Not_found -> return state
+      record nick text
     in
-    Lwt_list.fold_left_s on_match state (exec_all mention_re text)
+    Lwt_list.fold_left_s on_match state (extract_mentions text)
 
   and forward ({ State.mailboxes } as state) joined =
     let mail = 
