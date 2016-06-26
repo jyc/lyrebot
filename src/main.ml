@@ -64,8 +64,10 @@ let send outp msg =
 let nick, userprefix_re, mention_re =
   (* Can't use word because @ and : are not word characters (?). *)
   let bound = Re.(alt [char ' '; bos; eos]) in
-  let special = Re.(alt [char '['; char ']'; char '\\'; char '`'; char '_'; char '^'; char '{'; char '|'; char '}']) in
-  let nick = Re.(seq [alt [alpha; special]; repn (alt [alnum; special; char '-']) 0 (Some 8) ]) in
+  let special = Re.(alt [char '['; char ']'; char '\\'; char '`'; char '_';
+                         char '^'; char '{'; char '|'; char '}']) in
+  let nick = Re.(seq [alt [alpha; special];
+                      repn (alt [alnum; special; char '-']) 0 (Some 8) ]) in
 
   nick,
   Re.(compile (seq [group nick; char '!'; group (rep1 any)])),
@@ -93,64 +95,69 @@ let ago s =
   else if s < 86400. then sprintf "%.1fh ago" (s /. 3600.)
   else sprintf "%.0fd ago" (s /. 86400.)
 
+
+(** [execute message state msg from target text] handles the message [msg] sent
+    from the user whose nick is [from] in [target] (either [channel] or
+    [nick]) with text [text].
+    [privmsg target text dest] is used to send responses. *)
+let rec execute privmsg state msg from target text =
+  let { State.mailboxes; neighbors } = state in
+  let on_match state nick =
+    (** [record dest text] tries to record the message [text] for the user
+        with nick [dest]. *)
+    let record dest text =
+      if NickSet.mem dest neighbors then return state
+      else
+        privmsg from @@ sprintf
+          "I'll forward your message the next time %s logs in." dest
+        >>= fun () ->
+        let mail = { Mail.time = Unix.time (); from; text } in
+        let old =
+          if NickMap.mem dest mailboxes then NickMap.find dest mailboxes
+          else []
+        in
+        return { state with
+                 State.mailboxes = NickMap.add dest (mail :: old) mailboxes }
+    in
+    record nick text
+  in
+  Lwt_list.fold_left_s on_match state (extract_mentions text)
+
+(** [forward message state joined] forwards the messages in the mailbox in
+    [state] for [joined] and returns an updated state with that mailbox removed.
+    [privmsg target text dest] is used to send responses. *)
+let forward privmsg ({ State.mailboxes } as state) joined =
+  let mail =
+    if NickMap.mem joined mailboxes then NickMap.find joined mailboxes
+    else []
+  in
+  if mail = [] then return state
+  else
+    privmsg joined "*** You've got mail! ***"
+    >>= fun () ->
+    Lwt_list.iter_s (fun { Mail.time; from; text } ->
+      let { Unix.tm_hour; tm_min; tm_mday; tm_mon } = Unix.gmtime time in
+      let dt = Unix.time () -. time in
+      privmsg joined @@ sprintf
+        "%02d:%02d %d/%d (%s)  <%s> %s"
+        tm_hour tm_min (tm_mon + 1) tm_mday (ago dt) from text
+    ) mail
+    >>= fun () ->
+    return { state with State.mailboxes = NickMap.remove joined mailboxes }
+
 (** [work (inp, outp)] never returns. It sets up the loop for responding to IRC
     messages using [inp] and [outp] channels connected to the IRC server. *)
 let work ~nick ~channel (inp, outp) =
   let send = send outp in
-  let message other ?(target=other) text =
-    let text' =
-      if target = other then text
-      else sprintf "%s: %s" other text
-    in
-    send (Message.make "PRIVMSG" ~trailing:text' [target])
+  let privmsg target text =
+    send (Message.make "PRIVMSG" ~trailing:text [target])
   in
-
-  (** [execute state msg from target text] handles the message [msg] sent from
-      the user whose nick is [from] in [target] (either [channel] or [nick])
-      with text [text]. *)
-  let rec execute ({ State.mailboxes; neighbors } as state) msg from target text =
-    let on_match state nick =
-      (** [record dest text] tries to record the message [text] for the user
-          with nick [dest]. *)
-      let record dest text =
-        if NickSet.mem dest neighbors then return state
-        else
-          message from @@ sprintf "I'll forward your message the next time %s logs in." dest
-          >>= fun () ->
-          let mail = { Mail.time = Unix.time (); from; text } in
-          let old =
-            if NickMap.mem dest mailboxes then NickMap.find dest mailboxes
-            else []
-          in
-          return { state with
-                   State.mailboxes = NickMap.add dest (mail :: old) mailboxes }
-      in
-      record nick text
-    in
-    Lwt_list.fold_left_s on_match state (extract_mentions text)
-
-  and forward ({ State.mailboxes } as state) joined =
-    let mail =
-      if NickMap.mem joined mailboxes then NickMap.find joined mailboxes
-      else []
-    in
-    if mail = [] then return state
-    else
-      message joined "*** You've got mail! ***"
-      >>= fun () ->
-      Lwt_list.iter_s (fun { Mail.time; from; text } ->
-        let { Unix.tm_hour; tm_min; tm_mday; tm_mon } = Unix.gmtime time in
-        let dt = Unix.time () -. time in
-        message joined @@ sprintf "%02d:%02d %d/%d (%s)  <%s> %s" tm_hour tm_min (tm_mon + 1) tm_mday (ago dt) from text
-      ) mail
-      >>= fun () ->
-      return { state with State.mailboxes = NickMap.remove joined mailboxes }
 
   (** [handle state] handles IRC-level commands like PING, end of MOTD, etc.
       It is responsible for identifying on the first PING and joining on the end of MOTD.
       (This seems to work the best based on experience.)
       Bot-level commands are handled in [execute]. *)
-  and handle ({ State.registered; neighbors } as state) =
+  let rec handle ({ State.registered; neighbors } as state) =
     Lwt_io.read_line_opt inp
     >>= function
     | None -> return ()
@@ -164,7 +171,8 @@ let work ~nick ~channel (inp, outp) =
       | `Ok { Message.command = "PING"; trailing = Some trailing } ->
         send (Message.make "PONG" ~trailing [])
         >>= fun () ->
-        (if not registered then send (Message.make "USER" ~trailing:nick [nick; "0"; "*"])
+        (if not registered then
+           send (Message.make "USER" ~trailing:nick [nick; "0"; "*"])
          else return ())
         >>= fun () ->
         handle { state with State.registered = true }
@@ -177,7 +185,8 @@ let work ~nick ~channel (inp, outp) =
 
       (* Error: not registered. *)
       | `Ok { Message.command = "451"; trailing } ->
-        Lwt.fail_with @@ sprintf "Registration error: %s" (Option.default "n/a" trailing)
+        Lwt.fail_with @@ sprintf
+          "Registration error: %s" (Option.default "n/a" trailing)
 
       (* Error: nickname in use. *)
       | `Ok { Message.command = "433"; trailing } ->
@@ -202,26 +211,30 @@ let work ~nick ~channel (inp, outp) =
                }
 
       (* PART
-         For PART/JOIN the RFC seems to indicate that the target be included in the middles,
-         but with UnrealIRCd it seems like it was included in the trailing.
-         Because we only join one channel right now we'll just ignore it. *)
-      | `Ok ({ Message.command = "PART" | "QUIT"; prefix = Some prefix } as msg) ->
+         For PART/JOIN the RFC seems to indicate that the target be included in
+         the middles, but with UnrealIRCd it seems like it was included in the
+         trailing. Because we only join one channel right now we'll just ignore
+         it. *)
+      | `Ok ({ Message.command = "PART" | "QUIT";
+               prefix = Some prefix } as msg) ->
         begin match Re.Group.all (Re.exec userprefix_re prefix) with
         | [|_; nick; _|] ->
           handle { state with State.neighbors = NickSet.remove nick neighbors }
         | _ ->
-          Lwt.fail_with @@ sprintf "Error: unrecognized PART/QUIT message: %s" (Message.show msg)
+          Lwt.fail_with @@ sprintf
+            "Error: unrecognized PART/QUIT message: %s" (Message.show msg)
         end
 
       (* JOIN *)
       | `Ok ({ Message.command = "JOIN"; prefix = Some prefix } as msg) ->
         begin match Re.Group.all (Re.exec userprefix_re prefix) with
         | [|_; nick; _|] ->
-          forward state nick
+          forward privmsg state nick
           >>= fun state' ->
           handle { state' with State.neighbors = NickSet.add nick neighbors }
         | _ ->
-          Lwt.fail_with @@ sprintf "Error: unrecognized JOIN message: %s" (Message.show msg)
+          Lwt.fail_with @@ sprintf
+            "Error: unrecognized JOIN message: %s" (Message.show msg)
         end
 
       (* KILL nick comment *)
@@ -233,27 +246,34 @@ let work ~nick ~channel (inp, outp) =
         handle { state with State.neighbors = NickSet.remove nick neighbors }
 
       (* NICK nickname hopcount *)
-      | `Ok ({ Message.command = "NICK"; prefix = Some prefix; trailing = Some new_nick } as msg) ->
+      | `Ok ({ Message.command = "NICK"; prefix = Some prefix;
+               trailing = Some new_nick } as msg) ->
         begin match Re.Group.all (Re.exec userprefix_re prefix) with
         | [|_; old_nick; _|] ->
-          handle { state with State.neighbors = NickSet.update old_nick new_nick neighbors }
+          handle { state with State.neighbors =
+                                NickSet.update old_nick new_nick neighbors
+                 }
         | _ ->
-          Lwt.fail_with @@ sprintf "Error: unrecognized JOIN message: %s" (Message.show msg)
+          Lwt.fail_with @@ sprintf
+            "Error: unrecognized JOIN message: %s" (Message.show msg)
         end
 
       (* PRIVMSG *)
-      | `Ok ({ Message.command = "PRIVMSG"; prefix = Some prefix; middles = [target]; trailing = Some text } as msg) ->
+      | `Ok ({ Message.command = "PRIVMSG"; prefix = Some prefix;
+               middles = [target]; trailing = Some text } as msg) ->
         begin match Re.Group.all (Re.exec userprefix_re prefix) with
         | [|_; nick; _|] when nick <> "" ->
           return nick
         | _ ->
-          Lwt.fail_with @@ sprintf "Error: Unrecognized user prefix in PRIVMSG message: %s" (Message.show msg)
+          Lwt.fail_with @@ sprintf
+            "Error: Unrecognized user prefix in PRIVMSG message: %s"
+            (Message.show msg)
         end
         >>= fun from ->
         debug (fun () ->
           printf "[%s] %s: %s\n%!" target from text
         ) ;
-        execute state msg from target text
+        execute privmsg state msg from target text
         >>= fun state' ->
         handle state'
 
@@ -275,7 +295,9 @@ let start ~host ~service ~nick ~channel =
   >>= fun ais ->
   match ais with
   | [] ->
-    error @@ sprintf "getaddrinfo: Failed to determine socket parameters to connect to %s:%s." host service ;
+    error @@ sprintf
+      "getaddrinfo: Failed to determine socket parameters to connect to %s:%s."
+      host service ;
   | { Lwt_unix.ai_addr } :: _ ->
     Lwt_io.with_connection ai_addr (fun (inp, outp) ->
       let shutdown _ =
@@ -340,4 +362,5 @@ let () =
   (* -host, -service, -nick, -channel are required. *)
   reqs host ; reqs service ; reqs nick ; reqs channel ;
 
-  Lwt_main.run (start ~host:!host ~service:!service ~nick:!nick ~channel:!channel)
+  Lwt_main.run @@
+    start ~host:!host ~service:!service ~nick:!nick ~channel:!channel
