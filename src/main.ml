@@ -207,7 +207,7 @@ let execute_smses ~plivo_config ~number_map privmsg from text =
       | `Ok -> (nick :: successes, failures)
       | `Error msg ->
         fprintf stderr 
-          "Internal error while sending message %S from '%s' to '%s': %s"
+          "Internal error while sending message %S from '%s' to '%s': %s\n%!"
           text from nick msg ;
         (successes, (nick, `Internal) :: failures)
       end
