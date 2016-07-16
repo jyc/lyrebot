@@ -6,4 +6,7 @@ PKG utop
 PKG re
 PKG batteries
 PKG ppx_deriving.std
+PKG scgi
+PKG curl
+PKG yojson
 # end

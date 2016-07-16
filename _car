@@ -9,6 +9,9 @@ requires = [
     "re"
     "batteries"
     "ppx_deriving.std"
+    "scgi"
+    "curl"
+    "yojson"
 ]
 # A list of additional flags to pass to ocamlbuild.
 flags = []

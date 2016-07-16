@@ -1,8 +1,8 @@
 open Batteries
 open Printf
 open Lwt
-
 open IRC
+
 let warning s =
   fprintf stderr "Warning: %s\n" s
 
@@ -22,6 +22,17 @@ module Mail = struct
     text : string;
   }
 end
+
+type plivo_config = {
+  auth_id : string;
+  auth_token : string;
+  src_number : string;
+}
+
+type sendq_item = {
+  target : string;
+  text : string;
+}
 
 (* IRC nicknames are case-insensitive. *)
 module NickMap = Map.Make(IRC.Nick)
@@ -61,7 +72,7 @@ let send outp msg =
   Lwt_io.flush outp
 
 (* RFC 2812 2.3.1 *)
-let nick, userprefix_re, mention_re =
+let nick, userprefix_re, mention_re, sms_re =
   (* Can't use word because @ and : are not word characters (?). *)
   let bound = Re.(alt [char ' '; bos; eos]) in
   let special = Re.(alt [char '['; char ']'; char '\\'; char '`'; char '_';
@@ -71,7 +82,8 @@ let nick, userprefix_re, mention_re =
 
   nick,
   Re.(compile (seq [group nick; char '!'; group (rep1 any)])),
-  Re.(compile (seq [bound; char '@'; group nick; bound]))
+  Re.(compile (seq [bound; char '@'; group nick; bound])),
+  Re.(compile (seq [bound; char '?'; group nick; bound]))
 
 (* We have to do this ourselves instead of using Re.exec_all because Re doesn't
    treat the start of the substring indicated by ~pos as the start of the
@@ -79,6 +91,16 @@ let nick, userprefix_re, mention_re =
 let extract_mentions text =
   let rec loop matches rest =
     match Re.exec_opt mention_re rest with
+    | Some groups ->
+      let nick = Re.Group.get groups 1 in
+      loop (nick :: matches) (String.tail rest (Re.Group.stop groups 1))
+    | None -> matches
+  in
+  loop [] text
+
+let extract_smses text =
+  let rec loop matches rest =
+    match Re.exec_opt sms_re rest with
     | Some groups ->
       let nick = Re.Group.get groups 1 in
       loop (nick :: matches) (String.tail rest (Re.Group.stop groups 1))
@@ -95,37 +117,111 @@ let ago s =
   else if s < 86400. then sprintf "%.1fh ago" (s /. 3600.)
   else sprintf "%.0fd ago" (s /. 86400.)
 
-
-(** [execute message state msg from target text] handles the message [msg] sent
-    from the user whose nick is [from] in [target] (either [channel] or
-    [nick]) with text [text].
-    [privmsg target text dest] is used to send responses. *)
-let rec execute privmsg state msg from target text =
+(** [execute_mentions message state from target text] handles the message sent
+    from the user whose nick is [from] in [target] (either [channel] or [nick])
+    with text [text].
+    [privmsg target text] is used to send responses. *)
+let execute_mentions privmsg state from text =
   let { State.mailboxes; neighbors } = state in
   let on_match state nick =
-    (** [record dest text] tries to record the message [text] for the user
-        with nick [dest]. *)
-    let record dest text =
-      if NickSet.mem dest neighbors then return state
-      else
-        privmsg from @@ sprintf
-          "I'll forward your message the next time %s logs in." dest
-        >>= fun () ->
-        let mail = { Mail.time = Unix.time (); from; text } in
-        let old =
-          if NickMap.mem dest mailboxes then NickMap.find dest mailboxes
-          else []
-        in
-        return { state with
-                 State.mailboxes = NickMap.add dest (mail :: old) mailboxes }
-    in
-    record nick text
+    if NickSet.mem nick neighbors then return state
+    else
+      privmsg from @@ sprintf
+        "I'll forward your message the next time %s logs in." nick
+      >>= fun () ->
+      let mail = { Mail.time = Unix.time (); from; text } in
+      let old =
+        if NickMap.mem nick mailboxes then NickMap.find nick mailboxes
+        else []
+      in
+      return { state with
+               State.mailboxes = NickMap.add nick (mail :: old) mailboxes }
   in
   Lwt_list.fold_left_s on_match state (extract_mentions text)
 
+(** [and_list xs] returns [xs] separated by "," and "and" following English
+    conventions. *)
+let and_list = function
+  | [] -> ""
+  | [x] -> x
+  | [x; y] -> x ^ " and " ^ y
+  | x :: xs ->
+    let out = Buffer.create 17 in
+    let add = Buffer.add_string out in
+    add x ;
+    let rec loop = function
+      | [] -> ()
+      | [y] ->
+        add (", and " ^ y)
+      | y :: ys ->
+        add (", " ^ y) ;
+        loop ys
+    in
+    loop xs ;
+    Buffer.contents out
+
+let execute_smses_report successes failures =
+  let out = Buffer.create 17 in
+  let adds = Buffer.add_string out in
+  let failures' =
+    List.map (fun (nick, status) ->
+      nick ^ " " ^
+      match status with
+      | `Internal -> "(internal error)"
+      | `NotFound -> "(number not found)"
+    ) failures
+  in
+  if successes <> [] then begin
+    adds "I successfully texted " ;
+    adds (and_list successes) ;
+    adds "."
+  end ;
+  if failures <> [] then begin
+    if successes <> [] then adds " " ;
+    adds "I failed to text to " ;
+    adds (and_list failures') ;
+    adds "."
+  end ;
+  Buffer.contents out
+
+let execute_smses ~plivo_config ~number_map privmsg from text =
+  let on_match (successes, failures) nick =
+    match NickMap.find nick number_map with
+    | number ->
+      (* Note: Plivo’s Message API breaks long SMS text messages into multiple
+         SMS and adds a concatenation header to each message so that it can be
+         stitched together (i.e., concatenated) at receiver’s mobile device.
+         Though, some carriers and handsets do not support long SMS
+         concatenation.
+         -- https://www.plivo.com/docs/getting-started/send-a-long-sms/ *)
+      let text' =
+        sprintf "%s (via IRC) says: %s" from text
+      in
+      begin match
+        Plivo.send
+          ~auth_id:plivo_config.auth_id ~auth_token:plivo_config.auth_token
+          ~src:plivo_config.src_number ~dst:number ~text:text'
+      with
+      | `Ok -> (nick :: successes, failures)
+      | `Error msg ->
+        fprintf stderr 
+          "Internal error while sending message %S from '%s' to '%s': %s"
+          text from nick msg ;
+        (successes, (nick, `Internal) :: failures)
+      end
+    | exception Not_found ->
+      (successes, (nick, `NotFound) :: failures)
+  in
+  let successes, failures =
+    List.fold_left on_match ([], []) (extract_smses text)
+  in
+  if successes <> [] || failures <> [] then
+    privmsg from @@ execute_smses_report successes failures
+  else return ()
+
 (** [forward message state joined] forwards the messages in the mailbox in
     [state] for [joined] and returns an updated state with that mailbox removed.
-    [privmsg target text dest] is used to send responses. *)
+    [privmsg target text] is used to send responses. *)
 let forward privmsg ({ State.mailboxes } as state) joined =
   let mail =
     if NickMap.mem joined mailboxes then NickMap.find joined mailboxes
@@ -147,7 +243,7 @@ let forward privmsg ({ State.mailboxes } as state) joined =
 
 (** [work (inp, outp)] never returns. It sets up the loop for responding to IRC
     messages using [inp] and [outp] channels connected to the IRC server. *)
-let work ~nick ~channel (inp, outp) =
+let work ~plivo_config ~number_map ~nick ~channel ~sendq (inp, outp) =
   let send = send outp in
   let privmsg target text =
     send (Message.make "PRIVMSG" ~trailing:text [target])
@@ -158,10 +254,19 @@ let work ~nick ~channel (inp, outp) =
       (This seems to work the best based on experience.)
       Bot-level commands are handled in [execute]. *)
   let rec handle ({ State.registered; neighbors } as state) =
-    Lwt_io.read_line_opt inp
+    Lwt.choose [
+      (Lwt_io.read_line_opt inp
+       >>= fun maybe_line ->
+       return @@ `Line maybe_line);
+      (Lwt_mvar.take sendq
+       >>= fun sendq_item ->
+       return @@ `Send sendq_item);
+    ]
     >>= function
-    | None -> return ()
-    | Some line ->
+    | `Send { target; text } ->
+      privmsg target text
+    | `Line None -> return ()
+    | `Line (Some line) ->
       begin match Message.of_string line with
       | `Error s ->
         warning @@ sprintf "Received malformed message: %s" s ;
@@ -189,7 +294,7 @@ let work ~nick ~channel (inp, outp) =
           "Registration error: %s" (Option.default "n/a" trailing)
 
       (* Error: nickname in use. *)
-      | `Ok { Message.command = "433"; trailing } ->
+      | `Ok { Message.command = "433" } ->
         Lwt.fail_with "Error: nickname in use."
 
       (* Names reply. Update our list of users in the channel. *)
@@ -207,7 +312,7 @@ let work ~nick ~channel (inp, outp) =
                  State.neighbors =
                    List.fold_left (fun neighbors nick ->
                      NickSet.add nick neighbors
-                     ) neighbors nicks
+                   ) neighbors nicks
                }
 
       (* PART
@@ -273,8 +378,10 @@ let work ~nick ~channel (inp, outp) =
         debug (fun () ->
           printf "[%s] %s: %s\n%!" target from text
         ) ;
-        execute privmsg state msg from target text
+        execute_mentions privmsg state from text
         >>= fun state' ->
+        execute_smses ~plivo_config ~number_map privmsg from text
+        >>= fun () ->
         handle state'
 
       | `Ok msg ->
@@ -290,7 +397,7 @@ let work ~nick ~channel (inp, outp) =
   handle State.empty
 
 (** [start] starts the connection and calls [work]. *)
-let start ~host ~service ~nick ~channel =
+let start ~plivo_config ~number_map ~sendq ~host ~service ~nick ~channel =
   Lwt_unix.getaddrinfo host service Unix.[AI_SOCKTYPE SOCK_STREAM]
   >>= fun ais ->
   match ais with
@@ -313,14 +420,102 @@ let start ~host ~service ~nick ~channel =
       in
       Sys.(set_signal sigint (Signal_handle shutdown)) ;
 
-      work ~nick ~channel (inp, outp)
+      work ~plivo_config ~number_map ~channel ~sendq ~nick (inp, outp)
     )
+
+let handle_plivo { auth_id; auth_token; src_number } sendq channel req =
+  print_endline "received request\n" ;
+
+  try
+    let msg_to = Scgi.Request.param_exn ~meth:`POST req "To" in
+    let msg_from = Scgi.Request.param_exn ~meth:`POST req "From" in
+    let msg_text = Scgi.Request.param_exn ~meth:`POST req "Text" in
+
+    assert (msg_to = src_number) ;
+
+    begin match
+      Plivo.send
+        ~auth_id ~auth_token:auth_token ~src:src_number ~dst:"19255770306"
+        ~text:"Thanks! Forwarding."
+    with
+    | `Ok -> ()
+    | `Error s -> prerr_endline s
+    end ;
+
+    let text =
+      sprintf "%s (via SMS) says: %s"
+        msg_from msg_text
+    in
+
+    Lwt_mvar.put sendq { target = channel; text }
+    >>= fun () ->
+    return { Scgi.Response.
+             status = `Ok;
+             headers = [];
+             body = `String "ok" }
+  with
+  | Not_found ->
+    return { Scgi.Response.
+             status = `Bad_request;
+             headers = [];
+             body = `String "bad" }
+
+let serve_plivo_endpoint ~config ~sendq ~channel ~port =
+  let rec loop () =
+    let callback req =
+      Lwt.catch
+        (fun () -> handle_plivo config sendq channel req)
+        (fun e ->
+           fprintf stderr "Handler error: %s\n%!" (Printexc.to_string e) ;
+           Printexc.print_backtrace stderr ;
+           Lwt.fail e
+        )
+    in
+    try Scgi.Server.handler_inet "lyrebot" "127.0.0.1" port callback
+    with
+    | Unix.Unix_error (Unix.EADDRINUSE, _, _) ->
+      fprintf stderr "lyrebot: %d is already in use. Shutting down...\n%!" port ;
+      exit 1
+    | Unix.Unix_error (Unix.EACCES, "bind", _) ->
+      fprintf stderr "lyrebot: You don't have access to port %d. Shutting down...\n%!" port ;
+      exit 1
+    | Unix.Unix_error _ as e ->
+      fprintf stderr "lyrebot: Server error: %s\n%!" (Printexc.to_string e) ;
+      Printexc.print_backtrace stderr ;
+      loop ()
+  in 
+  loop ()
+
+let parse_number_map path =
+  let unexpected_format () =
+    prerr_endline {|lyrebot: Expected {"name": "number", ...}.|} ;
+    exit 1
+  in
+  try
+    match Yojson.Basic.from_file path with
+    | `Assoc entries ->
+      List.fold_left (fun map -> function
+        | (nick, `String number) ->
+          NickMap.add nick number map
+        | _ -> unexpected_format ()
+      ) NickMap.empty entries
+    | _ -> unexpected_format ()
+  with e -> 
+    fprintf stderr "lyrebot: Failed to parse number map at '%s': %s."
+      path (Printexc.to_string e) ;
+    Printexc.print_backtrace stderr ;
+    exit 1
 
 let () =
   let host = ref "" in
   let service = ref "" in
   let nick = ref "" in
   let channel = ref "" in
+  let plivo_auth_id = ref "" in
+  let plivo_auth_token = ref "" in
+  let plivo_src_number = ref "" in
+  let plivo_port = ref 8081 in
+  let number_map = ref "" in
 
   let usage =
     "Usage: lyrebot [options]\n\
@@ -345,6 +540,18 @@ let () =
     ("-channel", Set_string channel,
      " The channel to connect to.");
 
+    ("-plivo-auth-id", Set_string plivo_auth_id,
+     " The Plivo authorization ID.");
+    ("-plivo-auth-token", Set_string plivo_auth_token,
+     " The Plivo authorization token.");
+    ("-plivo-src-number", Set_string plivo_src_number,
+     " The Plivo source number.");
+    ("-plivo-port", Set_int plivo_port,
+     " The port to serve the Plivo endpoint SCGI server on.");
+
+    ("-number-map", Set_string number_map,
+     " The path to a JSON file mapping from IRC nicks to phone numbers.");
+
     ("-debug", Set run_debug, "");
   ] in
   let specs = Arg.align specs in
@@ -359,8 +566,39 @@ let () =
     if !s = "" then show_usage ()
   in
 
-  (* -host, -service, -nick, -channel are required. *)
-  reqs host ; reqs service ; reqs nick ; reqs channel ;
+  reqs host ; reqs service ; reqs nick ; reqs channel ; reqs plivo_auth_id ;
+  reqs plivo_auth_token ; reqs plivo_src_number ; reqs number_map ;
+
+  let number_map = parse_number_map !number_map in
+
+  let plivo_config =
+    { auth_id = !plivo_auth_id;
+      auth_token = !plivo_auth_token;
+      src_number = !plivo_src_number;
+    }
+  in
+  let sendq = Lwt_mvar.create_empty () in
+  let server =
+    serve_plivo_endpoint
+      ~config:plivo_config ~sendq ~channel:!channel ~port:!plivo_port
+  in
+  let shutdown_waiter, shutdown_wakener = Lwt.wait () in
+
+  let shutdown _ =
+    print_endline "Received signal, shutting down..." ;
+    Lwt_io.shutdown_server server ;
+    Lwt.wakeup shutdown_wakener () ;
+    Curl.global_cleanup ()
+  in
+  Sys.(set_signal sigint (Signal_handle shutdown)) ;
+  Sys.(set_signal sigterm (Signal_handle shutdown)) ;
+
+  Curl.global_init Curl.CURLINIT_GLOBALALL ;
 
   Lwt_main.run @@
-    start ~host:!host ~service:!service ~nick:!nick ~channel:!channel
+  Lwt.choose [
+    start
+      ~plivo_config ~number_map ~sendq ~host:!host ~service:!service
+      ~nick:!nick ~channel:!channel;
+    shutdown_waiter
+  ]

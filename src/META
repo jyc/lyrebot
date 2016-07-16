@@ -1,5 +1,5 @@
 # begin mk META
-requires = "lwt utop re batteries ppx_deriving.std"
+requires = "lwt utop re batteries ppx_deriving.std scgi curl yojson"
 archive(byte) = "lyrebird.cma"
 archive(native) = "lyrebird.cmxa"
 # end

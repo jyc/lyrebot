@@ -2,3 +2,4 @@
 **/*.native
 **/*.d.byte
 **/*.top
+push.sh
