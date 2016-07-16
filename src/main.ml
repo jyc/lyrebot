@@ -38,6 +38,8 @@ type sendq_item = {
 module NickMap = Map.Make(IRC.Nick)
 module NickSet = Set.Make(IRC.Nick)
 
+module StringMap = Map.Make(String)
+
 module State = struct
   type t = {
     registered : bool;
@@ -254,7 +256,9 @@ let work ~plivo_config ~number_map ~nick ~channel ~sendq (inp, outp) =
       (This seems to work the best based on experience.)
       Bot-level commands are handled in [execute]. *)
   let rec handle ({ State.registered; neighbors } as state) =
-    Lwt.choose [
+    (* Important to [pick] instead of [choose] so that if we do one before the
+       other, we cancel the other so we can loop again. *)
+    Lwt.pick [
       (Lwt_io.read_line_opt inp
        >>= fun maybe_line ->
        return @@ `Line maybe_line);
@@ -265,6 +269,8 @@ let work ~plivo_config ~number_map ~nick ~channel ~sendq (inp, outp) =
     >>= function
     | `Send { target; text } ->
       privmsg target text
+      >>= fun () ->
+      handle state
     | `Line None -> return ()
     | `Line (Some line) ->
       begin match Message.of_string line with
@@ -423,9 +429,8 @@ let start ~plivo_config ~number_map ~sendq ~host ~service ~nick ~channel =
       work ~plivo_config ~number_map ~channel ~sendq ~nick (inp, outp)
     )
 
-let handle_plivo { auth_id; auth_token; src_number } sendq channel req =
-  print_endline "received request\n" ;
-
+let handle_plivo
+    { auth_id; auth_token; src_number } nick_map sendq channel req =
   try
     let msg_to = Scgi.Request.param_exn ~meth:`POST req "To" in
     let msg_from = Scgi.Request.param_exn ~meth:`POST req "From" in
@@ -436,15 +441,20 @@ let handle_plivo { auth_id; auth_token; src_number } sendq channel req =
     begin match
       Plivo.send
         ~auth_id ~auth_token:auth_token ~src:src_number ~dst:"19255770306"
-        ~text:"Thanks! Forwarding."
+        ~text:(sprintf "Thanks! Forwarding to %s." channel)
     with
     | `Ok -> ()
     | `Error s -> prerr_endline s
     end ;
 
+    let from =
+      match StringMap.find msg_from nick_map with
+      | nick -> nick ^ "#" ^ msg_from
+      | exception Not_found -> msg_from
+    in
+
     let text =
-      sprintf "%s (via SMS) says: %s"
-        msg_from msg_text
+      sprintf "%s (via SMS) says: %s" from msg_text
     in
 
     Lwt_mvar.put sendq { target = channel; text }
@@ -460,11 +470,11 @@ let handle_plivo { auth_id; auth_token; src_number } sendq channel req =
              headers = [];
              body = `String "bad" }
 
-let serve_plivo_endpoint ~config ~sendq ~channel ~port =
+let serve_plivo_endpoint ~config ~nick_map ~sendq ~channel ~port =
   let rec loop () =
     let callback req =
       Lwt.catch
-        (fun () -> handle_plivo config sendq channel req)
+        (fun () -> handle_plivo config nick_map sendq channel req)
         (fun e ->
            fprintf stderr "Handler error: %s\n%!" (Printexc.to_string e) ;
            Printexc.print_backtrace stderr ;
@@ -494,11 +504,12 @@ let parse_number_map path =
   try
     match Yojson.Basic.from_file path with
     | `Assoc entries ->
-      List.fold_left (fun map -> function
+      List.fold_left (fun (numbers, nicks) -> function
         | (nick, `String number) ->
-          NickMap.add nick number map
+          NickMap.add nick number numbers,
+          StringMap.add number nick nicks
         | _ -> unexpected_format ()
-      ) NickMap.empty entries
+      ) (NickMap.empty, StringMap.empty) entries
     | _ -> unexpected_format ()
   with e -> 
     fprintf stderr "lyrebot: Failed to parse number map at '%s': %s."
@@ -569,7 +580,7 @@ let () =
   reqs host ; reqs service ; reqs nick ; reqs channel ; reqs plivo_auth_id ;
   reqs plivo_auth_token ; reqs plivo_src_number ; reqs number_map ;
 
-  let number_map = parse_number_map !number_map in
+  let number_map, nick_map = parse_number_map !number_map in
 
   let plivo_config =
     { auth_id = !plivo_auth_id;
@@ -580,25 +591,34 @@ let () =
   let sendq = Lwt_mvar.create_empty () in
   let server =
     serve_plivo_endpoint
-      ~config:plivo_config ~sendq ~channel:!channel ~port:!plivo_port
+      ~config:plivo_config ~nick_map ~sendq ~channel:!channel
+      ~port:!plivo_port
   in
   let shutdown_waiter, shutdown_wakener = Lwt.wait () in
 
-  let shutdown _ =
-    print_endline "Received signal, shutting down..." ;
+  let shutdown () =
     Lwt_io.shutdown_server server ;
     Lwt.wakeup shutdown_wakener () ;
     Curl.global_cleanup ()
   in
-  Sys.(set_signal sigint (Signal_handle shutdown)) ;
-  Sys.(set_signal sigterm (Signal_handle shutdown)) ;
+  let shutdown_signaled _ =
+    print_endline "Received signal, shutting down..." ;
+    shutdown ()
+  in
+  Sys.(set_signal sigint (Signal_handle shutdown_signaled)) ;
+  Sys.(set_signal sigterm (Signal_handle shutdown_signaled)) ;
 
   Curl.global_init Curl.CURLINIT_GLOBALALL ;
 
   Lwt_main.run @@
-  Lwt.choose [
-    start
+  Lwt.join [
+    (start
       ~plivo_config ~number_map ~sendq ~host:!host ~service:!service
-      ~nick:!nick ~channel:!channel;
+      ~nick:!nick ~channel:!channel
+     >>= fun () ->
+     print_endline "IRC handling loop stopped, shutting down..." ;
+     shutdown () ;
+     return ()
+    );
     shutdown_waiter
   ]
