@@ -441,7 +441,7 @@ let handle_plivo
     begin match
       Plivo.send
         ~auth_id ~auth_token:auth_token ~src:src_number ~dst:"19255770306"
-        ~text:(sprintf "Thanks! Forwarding your message to %s." channel)
+        ~text:"✔️"
     with
     | `Ok -> ()
     | `Error s -> prerr_endline s
