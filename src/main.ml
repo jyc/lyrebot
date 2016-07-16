@@ -429,8 +429,8 @@ let start ~plivo_config ~number_map ~sendq ~host ~service ~nick ~channel =
       work ~plivo_config ~number_map ~channel ~sendq ~nick (inp, outp)
     )
 
-let handle_plivo
-    { auth_id; auth_token; src_number } nick_map sendq channel req =
+let handle_plivo ~config ~nick_map ~sendq ~channel ~number_map req =
+  let { auth_id; auth_token; src_number } = config in
   try
     let msg_to = Scgi.Request.param_exn ~meth:`POST req "To" in
     let msg_from = Scgi.Request.param_exn ~meth:`POST req "From" in
@@ -453,11 +453,14 @@ let handle_plivo
       | exception Not_found -> msg_from
     in
 
-    let text =
-      sprintf "%s (via SMS) says: %s" from msg_text
+    let text = sprintf "%s (via SMS) says: %s" from msg_text in
+    let textmsg target text =
+      Lwt_mvar.put sendq { target; text }
     in
 
     Lwt_mvar.put sendq { target = channel; text }
+    >>= fun () ->
+    execute_smses ~plivo_config:config ~number_map textmsg from text
     >>= fun () ->
     return { Scgi.Response.
              status = `Ok;
@@ -470,11 +473,13 @@ let handle_plivo
              headers = [];
              body = `String "bad" }
 
-let serve_plivo_endpoint ~config ~nick_map ~sendq ~channel ~port =
+let serve_plivo_endpoint ~config ~nick_map ~sendq ~channel ~number_map ~port =
   let rec loop () =
     let callback req =
       Lwt.catch
-        (fun () -> handle_plivo config nick_map sendq channel req)
+        (fun () ->
+           handle_plivo ~config ~nick_map ~sendq ~channel ~number_map req
+        )
         (fun e ->
            fprintf stderr "Handler error: %s\n%!" (Printexc.to_string e) ;
            Printexc.print_backtrace stderr ;
@@ -592,7 +597,7 @@ let () =
   let server =
     serve_plivo_endpoint
       ~config:plivo_config ~nick_map ~sendq ~channel:!channel
-      ~port:!plivo_port
+      ~number_map ~port:!plivo_port
   in
   let shutdown_waiter, shutdown_wakener = Lwt.wait () in
 
