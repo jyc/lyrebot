@@ -174,13 +174,13 @@ let execute_smses_report successes failures =
     ) failures
   in
   if successes <> [] then begin
-    adds "I successfully texted " ;
+    adds "Successfully texted " ;
     adds (and_list successes) ;
     adds "."
   end ;
   if failures <> [] then begin
     if successes <> [] then adds " " ;
-    adds "I failed to text to " ;
+    adds "Failed to text to " ;
     adds (and_list failures') ;
     adds "."
   end ;
@@ -441,7 +441,7 @@ let handle_plivo
     begin match
       Plivo.send
         ~auth_id ~auth_token:auth_token ~src:src_number ~dst:"19255770306"
-        ~text:(sprintf "Thanks! Forwarding to %s." channel)
+        ~text:(sprintf "Thanks! Forwarding your message to %s." channel)
     with
     | `Ok -> ()
     | `Error s -> prerr_endline s
