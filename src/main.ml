@@ -440,7 +440,7 @@ let handle_plivo
 
     begin match
       Plivo.send
-        ~auth_id ~auth_token:auth_token ~src:src_number ~dst:"19255770306"
+        ~auth_id ~auth_token:auth_token ~src:src_number ~dst:msg_from
         ~text:"✔️"
     with
     | `Ok -> ()
