@@ -186,7 +186,7 @@ let execute_smses_report successes failures =
   end ;
   Buffer.contents out
 
-let execute_smses ~plivo_config ~number_map privmsg from text =
+let execute_smses ~plivo_config ~number_map ~reply text =
   let on_match (successes, failures) nick =
     match NickMap.find nick number_map with
     | number ->
@@ -196,19 +196,16 @@ let execute_smses ~plivo_config ~number_map privmsg from text =
          Though, some carriers and handsets do not support long SMS
          concatenation.
          -- https://www.plivo.com/docs/getting-started/send-a-long-sms/ *)
-      let text' =
-        sprintf "%s (via IRC) says: %s" from text
-      in
       begin match
         Plivo.send
           ~auth_id:plivo_config.auth_id ~auth_token:plivo_config.auth_token
-          ~src:plivo_config.src_number ~dst:number ~text:text'
+          ~src:plivo_config.src_number ~dst:number ~text
       with
       | `Ok -> (nick :: successes, failures)
       | `Error msg ->
         fprintf stderr 
-          "Internal error while sending message %S from '%s' to '%s': %s\n%!"
-          text from nick msg ;
+          "Internal error while sending message %S from to '%s': %s\n%!"
+          text nick msg ;
         (successes, (nick, `Internal) :: failures)
       end
     | exception Not_found ->
@@ -218,7 +215,7 @@ let execute_smses ~plivo_config ~number_map privmsg from text =
     List.fold_left on_match ([], []) (extract_smses text)
   in
   if successes <> [] || failures <> [] then
-    privmsg from @@ execute_smses_report successes failures
+    reply @@ execute_smses_report successes failures
   else return ()
 
 (** [forward message state joined] forwards the messages in the mailbox in
@@ -243,13 +240,18 @@ let forward privmsg ({ State.mailboxes } as state) joined =
     >>= fun () ->
     return { state with State.mailboxes = NickMap.remove joined mailboxes }
 
+let privmsg send target text =
+  let msg = Message.make "PRIVMSG" ~trailing:text [target] in
+  let parts = Message.split_trailing msg in
+  Lwt_list.iter_s (fun part ->
+    send part
+  ) parts
+
 (** [work (inp, outp)] never returns. It sets up the loop for responding to IRC
     messages using [inp] and [outp] channels connected to the IRC server. *)
 let work ~plivo_config ~number_map ~nick ~channel ~sendq (inp, outp) =
   let send = send outp in
-  let privmsg target text =
-    send (Message.make "PRIVMSG" ~trailing:text [target])
-  in
+  let privmsg = privmsg send in
 
   (** [handle state] handles IRC-level commands like PING, end of MOTD, etc.
       It is responsible for identifying on the first PING and joining on the end of MOTD.
@@ -386,7 +388,8 @@ let work ~plivo_config ~number_map ~nick ~channel ~sendq (inp, outp) =
         ) ;
         execute_mentions privmsg state from text
         >>= fun state' ->
-        execute_smses ~plivo_config ~number_map privmsg from text
+        let text' = sprintf "%s says: %s" from text in
+        execute_smses ~plivo_config ~number_map ~reply:(privmsg from) text'
         >>= fun () ->
         handle state'
 
@@ -432,20 +435,17 @@ let start ~plivo_config ~number_map ~sendq ~host ~service ~nick ~channel =
 let handle_plivo ~config ~nick_map ~sendq ~channel ~number_map req =
   let { auth_id; auth_token; src_number } = config in
   try
-    let msg_to = Scgi.Request.param_exn ~meth:`POST req "To" in
-    let msg_from = Scgi.Request.param_exn ~meth:`POST req "From" in
-    let msg_text = Scgi.Request.param_exn ~meth:`POST req "Text" in
+    let post = Scgi.Request.param_exn ~meth:`POST req in
+    let msg_to = post "To" in
+    let msg_from = post "From" in
+    let msg_text = post "Text" in
+    let msg_uuid = post "MessageUUID" in
+
+    debug (fun () ->
+      printf "Plivo: received message with UUID %s.\n" msg_uuid
+    ) ;
 
     assert (msg_to = src_number) ;
-
-    begin match
-      Plivo.send
-        ~auth_id ~auth_token:auth_token ~src:src_number ~dst:msg_from
-        ~text:"✔️"
-    with
-    | `Ok -> ()
-    | `Error s -> prerr_endline s
-    end ;
 
     let from =
       match StringMap.find msg_from nick_map with
@@ -453,14 +453,29 @@ let handle_plivo ~config ~nick_map ~sendq ~channel ~number_map req =
       | exception Not_found -> msg_from
     in
 
-    let text = sprintf "%s (via SMS) says: %s" from msg_text in
-    let textmsg target text =
-      Lwt_mvar.put sendq { target; text }
+    let text = sprintf "%s says: %s" from msg_text in
+
+    let reply_buffer = Buffer.create 17 in
+    Buffer.add_string reply_buffer "✔️" ;
+
+    let reply text =
+      Buffer.add_string reply_buffer " " ;
+      Buffer.add_string reply_buffer text ;
+      return ()
     in
 
     Lwt_mvar.put sendq { target = channel; text }
     >>= fun () ->
-    execute_smses ~plivo_config:config ~number_map textmsg from text
+    execute_smses ~plivo_config:config ~number_map ~reply text
+    >>= fun () ->
+    begin match
+      Plivo.send
+        ~auth_id ~auth_token
+        ~src:src_number ~dst:msg_from ~text:(Buffer.contents reply_buffer)
+    with
+    | `Ok -> return ()
+    | `Error s -> Lwt_io.eprintl s
+    end
     >>= fun () ->
     return { Scgi.Response.
              status = `Ok;

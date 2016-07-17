@@ -1,3 +1,5 @@
+open Batteries
+
 let crlf = "\r\n"
 
 module Message = struct
@@ -35,7 +37,7 @@ module Message = struct
     | exception Not_found -> `Error "[s] is not a recognized IRC message string."
     | _ -> `Error "[s] is not a recognized IRC message string."
 
-  let to_string { prefix; command; middles; trailing } =
+  let header_string { prefix; command; middles; trailing } =
     let out = Buffer.create 17 in
     let addc = Buffer.add_char out in
     let adds = Buffer.add_string out in
@@ -52,12 +54,40 @@ module Message = struct
       adds s
     ) middles ;
     begin match trailing with
-    | Some s ->
+    | Some _ ->
       adds " :" ;
-      adds s
     | None -> ()
     end ;
     Buffer.contents out
+
+  let to_string message =
+    let { trailing } = message in
+    let out = Buffer.create 17 in
+    Buffer.add_string out (header_string message) ;
+    begin match trailing with
+    | None -> ()
+    | Some s -> 
+      Buffer.add_string out s
+    end ;
+    Buffer.contents out
+
+  let rec split_trailing ?(len=512) message = 
+    let header_len = String.length (header_string message) in
+    assert (header_len < len) ;
+    match message.trailing with
+    | None -> [message]
+    | Some trailing ->
+      let trailing_len = String.length trailing in
+    if header_len + trailing_len <= len then [message]
+    else
+      let hd = { message with
+                 trailing = Some (String.head trailing (512 - header_len)) }
+      in
+      let tl = { message with
+                 trailing = Some (String.tail trailing (512 - header_len)) }
+      in
+      hd :: split_trailing ~len tl
+
 end
 
 module Nick = struct
