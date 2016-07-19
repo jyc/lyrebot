@@ -4,10 +4,10 @@ open Lwt
 open IRC
 
 let warning s =
-  fprintf stderr "Warning: %s\n" s
+  fprintf stderr "Warning: %s\n%!" s
 
 let error s =
-  fprintf stderr "lyrebot: %s\n" s ;
+  fprintf stderr "lyrebot: %s\n%!" s ;
   exit 1
 
 let run_debug = ref false
