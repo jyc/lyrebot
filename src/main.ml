@@ -277,8 +277,8 @@ let work ~plivo_config ~number_map ~nick ~channel ~sendq (inp, outp) =
     | `Line (Some line) ->
       begin match Message.of_string line with
       | `Error s ->
-        warning @@ sprintf "Received malformed message: %s" s ;
-        return ()
+        warning @@ sprintf "Received malformed message (%s): %s" s line ;
+        handle state
 
       (* Need to respond to PINGs with PONGs. *)
       | `Ok { Message.command = "PING"; trailing = Some trailing } ->
