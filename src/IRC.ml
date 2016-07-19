@@ -20,8 +20,16 @@ module Message = struct
   let message_re = Re.(compile (seq [bos;
                                      opt (seq [prefix; space]); 
                                      group command; 
-                                     group (rep (seq [space; middle]));
-                                     opt (seq [space; char ':'; group (rep any)]);
+                                     alt [
+                                       (seq [
+                                          (group (repn (seq [space; middle]) 0 (Some 14)));
+                                          opt (seq [space; char ':'; group (rep any)])
+                                        ]);
+                                       (seq [
+                                          (group (repn (seq [space; middle]) 14 (Some 14)));
+                                          opt (seq [space; opt (char ':'); group (rep any)])
+                                        ])
+                                     ];
                                      eos]))
 
   let space_re = Re.(compile space)
@@ -29,7 +37,9 @@ module Message = struct
   (* See RFC 2812, 2.3.1 *)
   let of_string s =
     match Re.Group.all (Re.exec message_re s) with
-    | [|_; prefix; command; middles'; trailing|] ->
+    | ([|_; prefix; command; middles'; trailing; ""; ""|] |
+       [|_; prefix; command; ""; ""; middles'; trailing|])
+       ->
       let middles = Re.split space_re middles' in
       `Ok { prefix = if prefix = "" then None else Some prefix;
             command; middles;
